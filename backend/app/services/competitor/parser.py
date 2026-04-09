@@ -447,3 +447,151 @@ def extract_posts_from_text(raw_text: str) -> list[dict]:
 
     # Single post
     return [{"text": raw_text.strip(), "index": 1}]
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ENGLISH → RUSSIAN REWRITE + LEAD MAGNET
+# ═══════════════════════════════════════════════════════════════════
+
+TRANSLATE_REWRITE_SYSTEM = """
+Ты — мастер адаптации иностранного контента для русскоязычной Instagram-аудитории.
+
+Задача: взять английский пост/карусель, полностью ПЕРЕРАБОТАТЬ (не перевести!) на русский,
+сделать виральным для русскоязычной аудитории, добавить лид-магнит в конце.
+
+ПРАВИЛА:
+- НЕ буквальный перевод — АДАПТАЦИЯ. Локальные примеры, рубли, российские реалии.
+- Виральные формулы: шок-заголовок, КАПС, (скобки), парадокс, curiosity gap.
+- Текст как разговор с другом, на "ты", без канцеляризмов.
+- Каждый слайд тянет свайпнуть дальше.
+- Последний слайд: философский удар + CTA.
+- Caption: кликбейт в первых 2 строках + 5-7 хэштегов.
+- Для АКЦЕНТА: оберни 1-2 ключевых слова в *звёздочки*.
+- БЕЗ ЭМОДЗИ.
+
+Формат: СТРОГО JSON.
+"""
+
+
+async def rewrite_english_to_russian(
+    original_caption: str,
+    original_slides_text: str = "",
+    lead_magnet: str = "",
+    name: str = "Эксперт",
+    niche: str = "",
+    cta_text: str = "",
+) -> dict:
+    """
+    Take an English carousel/post and rewrite it as a Russian viral carousel.
+    Adds lead magnet to the CTA slide and caption.
+    """
+    logger.info(f"[Rewrite] EN→RU rewrite: {original_caption[:60]}...")
+
+    lead_magnet_instruction = ""
+    if lead_magnet:
+        lead_magnet_instruction = f"""
+
+LEAD MAGNET (обязательно добавить):
+В cta_text вставь: "{cta_text or 'Напиши + в директ'}"
+В конец caption добавь: "{lead_magnet}"
+"""
+
+    user_prompt = f"""Переработай этот английский пост в виральную русскоязычную карусель.
+
+ОРИГИНАЛ (английский):
+{original_caption}
+
+{f'ТЕКСТ СЛАЙДОВ: {original_slides_text}' if original_slides_text else ''}
+
+Автор: {name}, ниша: {niche}
+{lead_magnet_instruction}
+
+Выбери оптимальное количество слайдов (3-7 points).
+
+JSON:
+{{
+  "hook_title": "Виральный РУССКИЙ заголовок с КАПСОМ и (скобками)",
+  "slide_count": 7,
+  "points": [
+    {{
+      "title": "Цепляющий заголовок 3-8 слов с *акцентом*",
+      "body": "3-4 предложения. Адаптировано для русской аудитории."
+    }}
+  ],
+  "cta_text": "CTA + лид-магнит",
+  "caption": "Кликбейт + пункты + вопрос + лид-магнит + 5-7 хэштегов. 1400-1800 символов.",
+  "source_language": "en",
+  "adaptation_notes": "Что изменили при адаптации"
+}}"""
+
+    client = _get_client()
+    response = await asyncio.to_thread(
+        lambda: client.chat.completions.create(
+            model=settings.openai_model,
+            messages=[
+                {"role": "system", "content": TRANSLATE_REWRITE_SYSTEM},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.85,
+            max_tokens=4096,
+        )
+    )
+
+    result = _parse_json_safe(response.choices[0].message.content)
+    result["_meta"] = {
+        "source": "english_rewrite",
+        "original_caption_preview": original_caption[:100],
+        "lead_magnet_added": bool(lead_magnet),
+    }
+
+    logger.info(f"[Rewrite] EN→RU done: hook='{result.get('hook_title', '')[:50]}'")
+    return result
+
+
+async def analyze_and_rank_posts(posts: list[dict]) -> list[dict]:
+    """
+    Analyze a list of scraped posts, rank by virality.
+    Returns posts with analysis and viral scores.
+    """
+    if not posts:
+        return []
+
+    # Sort by engagement score
+    ranked = sorted(posts, key=lambda p: p.get("engagement_score", 0), reverse=True)
+
+    # Analyze top 5 with AI
+    top_posts = ranked[:5]
+    if not top_posts:
+        return ranked
+
+    posts_text = "\n\n".join([
+        f"--- POST #{i+1} (likes: {p['likes']}, comments: {p['comments']}) ---\n{p.get('caption', '')[:500]}"
+        for i, p in enumerate(top_posts)
+    ])
+
+    try:
+        client = _get_client()
+        response = await asyncio.to_thread(
+            lambda: client.chat.completions.create(
+                model=settings.openai_model,
+                messages=[
+                    {"role": "system", "content": "Analyze these Instagram posts. For each one, explain in 1-2 sentences WHY it went viral. Response: JSON array of {\"index\": 1, \"why_viral\": \"...\", \"rewrite_angle\": \"...\"}"},
+                    {"role": "user", "content": posts_text},
+                ],
+                temperature=0.5,
+                max_tokens=1500,
+            )
+        )
+        analysis = _parse_json_safe(response.choices[0].message.content)
+        if isinstance(analysis, dict) and "posts" in analysis:
+            analysis = analysis["posts"]
+        if isinstance(analysis, list):
+            for item in analysis:
+                idx = item.get("index", 0) - 1
+                if 0 <= idx < len(top_posts):
+                    top_posts[idx]["why_viral"] = item.get("why_viral", "")
+                    top_posts[idx]["rewrite_angle"] = item.get("rewrite_angle", "")
+    except Exception as e:
+        logger.warning(f"[Competitor] AI analysis failed: {e}")
+
+    return ranked

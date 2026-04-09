@@ -8,6 +8,7 @@ Three modes:
 Flow: Add competitor → Scrape posts → Analyze → Select viral topic → Rewrite → Generate carousel
 """
 import logging
+from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException
 from typing import Literal
 from pydantic import BaseModel, Field
@@ -669,15 +670,288 @@ async def generate_carousel_from_reel(
         raise HTTPException(500, f"Ошибка генерации из Reels: {str(e)}")
 
 
-def _get_color_scheme(scheme: str) -> dict:
-    schemes = {
-        "dark": {"bg_color": "#0f0f0f", "text_color": "#ffffff", "accent_color": "#ff6b35"},
-        "dark_luxury": {"bg_color": "#0f0f0f", "text_color": "#ffffff", "accent_color": "#ff6b35"},
-        "light": {"bg_color": "#fafafa", "text_color": "#1a1a1a", "accent_color": "#e74c3c"},
-        "light_clean": {"bg_color": "#fafafa", "text_color": "#1a1a1a", "accent_color": "#3498db"},
-        "gradient": {"bg_color": "#1a1a2e", "text_color": "#ffffff", "accent_color": "#e94560"},
-        "gradient_warm": {"bg_color": "#1a1a2e", "text_color": "#ffffff", "accent_color": "#e94560"},
-        "neon_dark": {"bg_color": "#0a0a0a", "text_color": "#ffffff", "accent_color": "#00ff88"},
-        "corporate": {"bg_color": "#1c2433", "text_color": "#ffffff", "accent_color": "#4a90d9"},
+# ═══════════════════════════════════════════════════════════════════
+# ENGLISH REWRITE — translate + adapt + add lead magnet
+# ═══════════════════════════════════════════════════════════════════
+
+class RewriteEnglishRequest(BaseModel):
+    """Rewrite an English post/carousel to Russian with lead magnet."""
+    original_caption: str = Field(..., max_length=5000)
+    original_slides_text: str = Field(default="", max_length=10000)
+    lead_magnet: str = Field(default="", max_length=500)
+    cta_text: str = Field(default="", max_length=300)
+    name: str = Field(default="Эксперт", max_length=100)
+    niche: str = Field(default="", max_length=200)
+    generate_slides: bool = True
+    color_scheme: str = "expert"
+    font_style: str = "luxury"
+    account_id: str | None = None
+
+
+@router.post("/rewrite-english")
+async def rewrite_english_carousel(
+    req: RewriteEnglishRequest,
+    user: dict = Depends(get_current_user),
+    db: Client = Depends(get_db),
+):
+    """
+    Take an English carousel/post, rewrite to Russian viral carousel,
+    add lead magnet, optionally generate slides.
+    """
+    from app.services.competitor.parser import rewrite_english_to_russian
+
+    # Step 1: AI rewrite
+    content = await rewrite_english_to_russian(
+        original_caption=req.original_caption,
+        original_slides_text=req.original_slides_text,
+        lead_magnet=req.lead_magnet,
+        name=req.name,
+        niche=req.niche,
+        cta_text=req.cta_text,
+    )
+
+    if not req.generate_slides:
+        return {"content": content, "message": "Текст готов, слайды не генерировались"}
+
+    # Step 2: Generate carousel slides
+    carousel_insert = db.table("carousels").insert({
+        "owner_id": user["id"],
+        "account_id": req.account_id,
+        "type": "topic",
+        "status": "generating",
+        "generation_params": {"source": "english_rewrite"},
+    }).execute()
+
+    if not carousel_insert.data:
+        raise HTTPException(status_code=500, detail="Failed to create carousel")
+
+    carousel_id = carousel_insert.data[0]["id"]
+
+    virtual_account = {
+        "username": req.name,
+        "city": "",
+        "niche": req.niche,
+        "brand_style": {},
+        "cta_final": req.cta_text or content.get("cta_text", ""),
+        "lead_magnet": req.lead_magnet,
     }
-    return schemes.get(scheme, schemes["dark_luxury"])
+
+    expert_tmpl_path = get_template_path(user["id"])
+
+    try:
+        updated = await generate_topic_carousel_pipeline(
+            carousel_id=carousel_id,
+            account=virtual_account,
+            font_style=req.font_style,
+            color_scheme=req.color_scheme,
+            expert_template_path=expert_tmpl_path,
+            pre_generated_content=content,
+        )
+        return {
+            "carousel_id": carousel_id,
+            "status": "ready",
+            "slides": updated.get("slides", []),
+            "caption": updated.get("caption", ""),
+            "content": content,
+            "message": "Карусель из английского поста готова!",
+        }
+    except Exception as e:
+        logger.error(f"EN rewrite generation failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ═══════════════════════════════════════════════════════════════════
+# MONITOR ENGLISH ACCOUNTS — scrape + auto-rewrite
+# ═══════════════════════════════════════════════════════════════════
+
+class AddMonitorRequest(BaseModel):
+    username: str = Field(..., pattern=r"^@?[a-zA-Z0-9._]{1,30}$")
+    language: str = Field(default="en", pattern=r"^(en|ru)$")
+    auto_rewrite: bool = True
+    lead_magnet: str = Field(default="", max_length=500)
+
+
+@router.post("/monitor/add")
+async def add_monitor_account(
+    req: AddMonitorRequest,
+    user: dict = Depends(get_current_user),
+    db: Client = Depends(get_db),
+):
+    """Add an account to monitor for auto-rewrite."""
+    username = req.username.lstrip("@")
+
+    # Check if already monitoring
+    existing = db.table("competitor_monitors").select("id").eq(
+        "owner_id", user["id"]
+    ).eq("username", username).execute()
+
+    if existing.data:
+        raise HTTPException(status_code=400, detail="Уже отслеживается")
+
+    result = db.table("competitor_monitors").insert({
+        "owner_id": user["id"],
+        "username": username,
+        "language": req.language,
+        "auto_rewrite": req.auto_rewrite,
+        "lead_magnet": req.lead_magnet,
+        "status": "active",
+        "last_checked_at": None,
+    }).execute()
+
+    return result.data[0] if result.data else {"status": "added"}
+
+
+@router.get("/monitor/list")
+async def list_monitors(
+    user: dict = Depends(get_current_user),
+    db: Client = Depends(get_db),
+):
+    """List all monitored accounts."""
+    try:
+        result = db.table("competitor_monitors").select("*").eq(
+            "owner_id", user["id"]
+        ).order("created_at", desc=True).execute()
+        return result.data or []
+    except Exception:
+        return []
+
+
+@router.delete("/monitor/{monitor_id}")
+async def delete_monitor(
+    monitor_id: str,
+    user: dict = Depends(get_current_user),
+    db: Client = Depends(get_db),
+):
+    """Remove a monitored account."""
+    db.table("competitor_monitors").delete().eq(
+        "id", monitor_id
+    ).eq("owner_id", user["id"]).execute()
+    return {"status": "deleted"}
+
+
+@router.post("/monitor/{monitor_id}/check")
+async def check_monitor_now(
+    monitor_id: str,
+    user: dict = Depends(get_current_user),
+    db: Client = Depends(get_db),
+):
+    """
+    Manually trigger a check on a monitored account.
+    Scrapes latest posts, finds new ones, rewrites and generates carousels.
+    """
+    from app.services.competitor.parser import rewrite_english_to_russian
+
+    # Get monitor config
+    monitor = db.table("competitor_monitors").select("*").eq(
+        "id", monitor_id
+    ).eq("owner_id", user["id"]).single().execute()
+
+    if not monitor.data:
+        raise HTTPException(status_code=404, detail="Монитор не найден")
+
+    monitor_data = monitor.data
+    username = monitor_data["username"]
+
+    # Get a scraper session from user's accounts
+    accounts_result = db.table("instagram_accounts").select(
+        "id, username, session_data, proxy"
+    ).eq("owner_id", user["id"]).eq("is_active", True).limit(1).execute()
+
+    if not accounts_result.data:
+        raise HTTPException(status_code=400, detail="Нет активных аккаунтов для скрейпинга")
+
+    account = accounts_result.data[0]
+    session_data = decrypt_data(account["session_data"])
+
+    # Login scraper
+    scraper = InstagramScraper()
+    logged_in = await scraper.login_by_session(
+        session_data={"settings": session_data},
+        proxy=account.get("proxy"),
+    )
+
+    if not logged_in:
+        raise HTTPException(status_code=400, detail="Сессия Instagram истекла")
+
+    # Fetch top posts (carousels)
+    posts = await scraper.get_top_posts(
+        username, count=20, top_n=5,
+        sort_by="engagement", carousels_only=True,
+    )
+
+    if not posts:
+        # Try all posts if no carousels
+        posts = await scraper.get_top_posts(username, count=20, top_n=5)
+
+    if not posts:
+        return {"message": f"Нет новых постов у @{username}", "rewritten": 0}
+
+    # Rewrite top post
+    top_post = posts[0]
+    lead_magnet = monitor_data.get("lead_magnet", "")
+
+    content = await rewrite_english_to_russian(
+        original_caption=top_post.get("caption", ""),
+        lead_magnet=lead_magnet,
+        name=account["username"],
+        niche="",
+    )
+
+    # Generate carousel from rewritten content
+    carousel_insert = db.table("carousels").insert({
+        "owner_id": user["id"],
+        "account_id": account["id"],
+        "type": "topic",
+        "status": "generating",
+        "generation_params": {
+            "source": "monitor_rewrite",
+            "original_url": top_post.get("url", ""),
+            "monitor_id": monitor_id,
+        },
+    }).execute()
+
+    carousel_id = carousel_insert.data[0]["id"]
+
+    virtual_account = {
+        "username": account["username"],
+        "city": "",
+        "niche": "",
+        "brand_style": {},
+        "cta_final": content.get("cta_text", ""),
+        "lead_magnet": lead_magnet,
+    }
+
+    expert_tmpl_path = get_template_path(user["id"])
+
+    updated = await generate_topic_carousel_pipeline(
+        carousel_id=carousel_id,
+        account=virtual_account,
+        font_style="luxury",
+        color_scheme="expert",
+        expert_template_path=expert_tmpl_path,
+        pre_generated_content=content,
+    )
+
+    # Update monitor last checked
+    db.table("competitor_monitors").update({
+        "last_checked_at": datetime.utcnow().isoformat(),
+    }).eq("id", monitor_id).execute()
+
+    return {
+        "message": f"Карусель из @{username} готова!",
+        "carousel_id": carousel_id,
+        "original_post": top_post.get("url", ""),
+        "rewritten_hook": content.get("hook_title", ""),
+        "slides_count": len(updated.get("slides", [])),
+    }
+
+
+def _get_color_scheme(scheme: str) -> dict:
+    from app.services.generator.image import DESIGN_TEMPLATES, CARD_TEMPLATES
+    if scheme in DESIGN_TEMPLATES:
+        t = DESIGN_TEMPLATES[scheme]
+        return {"bg_color": t["bg"], "text_color": t["text"], "accent_color": t["accent"]}
+    if scheme in CARD_TEMPLATES:
+        t = CARD_TEMPLATES[scheme]
+        return {"bg_color": t["bg"], "text_color": t["text"], "accent_color": t["accent"]}
+    return {"bg_color": "#0f0f0f", "text_color": "#ffffff", "accent_color": "#ff6b35"}
