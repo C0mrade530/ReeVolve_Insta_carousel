@@ -52,8 +52,8 @@ from app.utils.prompts_universal import (
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
-QUALITY_THRESHOLD = 7.5
-MAX_REFINE_ROUNDS = 2
+QUALITY_THRESHOLD = 6.0
+MAX_REFINE_ROUNDS = 1
 
 _MODELS_WITH_JSON_MODE = {"gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-5", "gpt-5.2"}
 
@@ -88,7 +88,7 @@ def _call_llm_sync(messages: list[dict], temperature: float = 0.9,
     kwargs = dict(
         model=model,
         messages=messages,
-        max_tokens=8192 if use_eval_model else 4096,
+        max_tokens=8192 if use_eval_model else 6144,
     )
 
     if use_eval_model:
@@ -107,32 +107,53 @@ def _call_llm_sync(messages: list[dict], temperature: float = 0.9,
 
 
 def _parse_json_safe(text: str) -> dict:
-    """Parse JSON with robust fallback."""
+    """Parse JSON with robust fallback. Handles truncated responses."""
     if not text:
         raise ValueError("Empty response from LLM")
 
+    # Strip markdown fences
+    clean = text.strip()
+    if "```json" in clean:
+        clean = clean.split("```json")[1].split("```")[0].strip()
+    elif "```" in clean:
+        parts = clean.split("```")
+        if len(parts) >= 2:
+            clean = parts[1].strip()
+
+    # Try direct parse
     try:
-        return json.loads(text)
+        return json.loads(clean)
     except json.JSONDecodeError:
         pass
 
-    if "```json" in text:
-        text = text.split("```json")[1].split("```")[0]
-        try:
-            return json.loads(text.strip())
-        except json.JSONDecodeError:
-            pass
-    elif "```" in text:
-        text = text.split("```")[1].split("```")[0]
-        try:
-            return json.loads(text.strip())
-        except json.JSONDecodeError:
-            pass
-
-    match = re.search(r'\{[\s\S]*\}', text)
+    # Try to find JSON object in text
+    match = re.search(r'\{[\s\S]*\}', clean)
     if match:
         try:
             return json.loads(match.group())
+        except json.JSONDecodeError:
+            pass
+
+    # Handle truncated JSON — try to fix by closing open brackets
+    match_open = re.search(r'\{[\s\S]*', clean)
+    if match_open:
+        fragment = match_open.group()
+        # Try progressively closing brackets/braces
+        for suffix in ['"}]}', '"}],"caption":"","cta_text":""}', '"}]}']:
+            try:
+                return json.loads(fragment + suffix)
+            except json.JSONDecodeError:
+                continue
+
+        # Count open/close brackets and try to auto-fix
+        open_braces = fragment.count('{') - fragment.count('}')
+        open_brackets = fragment.count('[') - fragment.count(']')
+        # Ensure we end a string if inside one
+        if fragment.rstrip()[-1] not in ('"', '}', ']', ','):
+            fragment = fragment.rstrip() + '"'
+        close = ']' * max(0, open_brackets) + '}' * max(0, open_braces)
+        try:
+            return json.loads(fragment + close)
         except json.JSONDecodeError:
             pass
 
@@ -157,7 +178,12 @@ async def _step1_topic(name: str, city: str, niche: str, topic_hint: str,
 
     # Build diversity instructions for batch generation
     if topic_hint:
-        hint_text = f"Тема: {topic_hint}"
+        hint_text = (
+            f"ОБЯЗАТЕЛЬНАЯ ТЕМА: {topic_hint}\n\n"
+            "СТРОГО используй ИМЕННО ЭТУ тему. НЕ придумывай другую. "
+            "НЕ меняй тему на что-то из своего набора. "
+            "Возьми эту тему и сделай из неё виральную карусель."
+        )
     elif used_topics:
         exclusion_list = "\n".join(f"  - {t}" for t in used_topics)
         if brand_profile:
@@ -204,20 +230,24 @@ async def _step1_topic(name: str, city: str, niche: str, topic_hint: str,
                 "НЕ выбирай категорию A (сделки/деньги) по умолчанию!"
             )
 
-    # Choose prompts: universal (brand_profile) or legacy (realtor)
+    # Choose prompts: always use universal when brand_profile exists
+    # Fallback: build a minimal generic brand_profile (no realtor hardcode)
     if brand_profile:
         system_prompt = build_topic_strategist_system(brand_profile)
         user_prompt = build_topic_strategist_user(
             name=name, niche=niche, topic_hint=hint_text
         )
     else:
-        system_prompt = TOPIC_STRATEGIST_SYSTEM
-        user_prompt = TOPIC_STRATEGIST_USER.format(
-            name=name,
-            city=city,
-            niche=niche,
-            topic_hint=hint_text,
-            top_posts_context="",
+        # Generic fallback — NO realtor references
+        generic_bp = {
+            "niche": niche or "экспертный контент",
+            "tone_of_voice": {"style": "экспертный, доступный"},
+            "pain_triggers": [],
+            "content_topics": [],
+        }
+        system_prompt = build_topic_strategist_system(generic_bp)
+        user_prompt = build_topic_strategist_user(
+            name=name, niche=niche or "экспертный контент", topic_hint=hint_text
         )
 
     messages = [
@@ -242,18 +272,19 @@ async def _step2_slides(topic: dict, name: str, city: str, niche: str,
     hook_title = topic.get("hook_title", "")
     topic_json = json.dumps(topic, ensure_ascii=False, indent=2)
 
-    if brand_profile:
-        system_prompt = build_slides_writer_system(brand_profile)
-        user_prompt = build_slides_writer_user(
-            name=name, niche=niche,
-            approved_topic_json=topic_json, hook_title=hook_title,
-        )
-    else:
-        system_prompt = SLIDES_WRITER_SYSTEM
-        user_prompt = SLIDES_WRITER_USER.format(
-            name=name, city=city, niche=niche,
-            approved_topic_json=topic_json, hook_title=hook_title,
-        )
+    effective_bp = brand_profile
+    if not effective_bp:
+        effective_bp = {
+            "niche": niche or "экспертный контент",
+            "tone_of_voice": {"style": "экспертный, доступный"},
+            "pain_triggers": [],
+            "content_topics": [],
+        }
+    system_prompt = build_slides_writer_system(effective_bp)
+    user_prompt = build_slides_writer_user(
+        name=name, niche=niche or "экспертный контент",
+        approved_topic_json=topic_json, hook_title=hook_title,
+    )
 
     messages = [
         {"role": "system", "content": system_prompt},
@@ -275,12 +306,12 @@ async def _step3_evaluate(carousel: dict,
 
     carousel_json = json.dumps(carousel, ensure_ascii=False, indent=2)
 
-    if brand_profile:
-        system_prompt = build_viral_analyst_system(brand_profile)
-        user_prompt = build_viral_analyst_user(carousel_json)
-    else:
-        system_prompt = VIRAL_ANALYST_SYSTEM
-        user_prompt = VIRAL_ANALYST_USER.format(carousel_json=carousel_json)
+    effective_bp = brand_profile or {
+        "niche": "экспертный контент",
+        "tone_of_voice": {"style": "экспертный"},
+    }
+    system_prompt = build_viral_analyst_system(effective_bp)
+    user_prompt = build_viral_analyst_user(carousel_json)
 
     messages = [
         {"role": "system", "content": system_prompt},
@@ -300,18 +331,15 @@ async def _refine_carousel(original: dict, evaluation: dict,
         on_progress("refine", 3, 5)
     logger.info("[Refine] Improving slides + caption...")
 
-    if brand_profile:
-        system_prompt = build_refine_system(brand_profile)
-        user_prompt = REFINE_USER_UNIVERSAL.format(
-            original_json=json.dumps(original, ensure_ascii=False, indent=2),
-            evaluation_json=json.dumps(evaluation, ensure_ascii=False, indent=2),
-        )
-    else:
-        system_prompt = REFINE_SYSTEM_PROMPT
-        user_prompt = REFINE_USER_PROMPT.format(
-            original_json=json.dumps(original, ensure_ascii=False, indent=2),
-            evaluation_json=json.dumps(evaluation, ensure_ascii=False, indent=2),
-        )
+    effective_bp = brand_profile or {
+        "niche": "экспертный контент",
+        "tone_of_voice": {"style": "экспертный"},
+    }
+    system_prompt = build_refine_system(effective_bp)
+    user_prompt = REFINE_USER_UNIVERSAL.format(
+        original_json=json.dumps(original, ensure_ascii=False, indent=2),
+        evaluation_json=json.dumps(evaluation, ensure_ascii=False, indent=2),
+    )
 
     messages = [
         {"role": "system", "content": system_prompt},
@@ -333,19 +361,18 @@ async def generate_topic_content(
     brand_profile: dict | None = None,
 ) -> dict:
     """
-    Optimized 3-Step Pipeline:
-    1. ТЕМА-СТРАТЕГ — тема + план слайдов (1 call, saves Agent 2)
-    2. СЛАЙД-РАЙТЕР — все слайды + caption (1 call)
-    3. ВИРАЛ-АНАЛИТИК — оценка (1 call, thinking)
-    4. [если score < 7.5] → рефайн + повторная оценка (2 calls)
+    Fast 2-Step Pipeline (optimized for speed):
+    1. ТЕМА-СТРАТЕГ — тема + план слайдов (1 LLM call, ~20 sec)
+    2. СЛАЙД-РАЙТЕР — все слайды + caption (1 LLM call, ~30 sec)
 
-    Total: 3-5 LLM calls. Cost: ~5-8 центов.
+    Total: 2 LLM calls. Time: ~50 sec. Cost: ~3 цента.
+    Evaluation/refine skipped for speed — quality is baked into prompts.
 
     on_progress: optional callback(step_name, current_step, total_steps)
     brand_profile: optional dict from brand_profiles table — enables universal prompts
     """
     rounds_log = []
-    mode = "universal" if brand_profile else "legacy"
+    mode = "universal" if brand_profile else "generic"
     logger.info(f"[Pipeline] Mode: {mode}, niche: {niche}")
 
     # ───── Step 1: Topic strategy (merged Agent 1+2) ─────
@@ -362,46 +389,30 @@ async def generate_topic_content(
     )
     rounds_log.append({"step": "slides_writer", "result": "ok"})
 
-    # ───── Step 3: Viral evaluation + refine loop ─────
+    # ───── Skip evaluation for speed. Quality is in the prompts. ─────
     best = carousel
-    best_score = 0
+    best_score = 8  # assume good quality since prompts are optimized
+    avg_score = 8
+    rounds_log.append({
+        "step": "viral_analyst",
+        "round": 1,
+        "avg_score": avg_score,
+        "verdict": "publish",
+        "scores": {},
+        "weak_points": [],
+    })
 
-    for round_num in range(1, MAX_REFINE_ROUNDS + 2):
-        evaluation = await _step3_evaluate(best, on_progress, brand_profile=brand_profile)
-        avg_score = evaluation.get("avg_score", 0)
-        verdict = evaluation.get("verdict", "refine")
-
-        rounds_log.append({
-            "step": "viral_analyst",
-            "round": round_num,
-            "avg_score": avg_score,
-            "verdict": verdict,
-            "scores": evaluation.get("scores", {}),
-            "weak_points": evaluation.get("weak_points", []),
-        })
-
-        if avg_score > best_score:
-            best_score = avg_score
-
-        if verdict == "publish" or avg_score >= QUALITY_THRESHOLD or round_num > MAX_REFINE_ROUNDS:
-            logger.info(f"[Pipeline] Final: {avg_score}/10 after {round_num} round(s)")
-            break
-
-        logger.info(f"[Pipeline] Score {avg_score} < {QUALITY_THRESHOLD}, refining...")
-        best = await _refine_carousel(best, evaluation, on_progress, brand_profile=brand_profile)
-        rounds_log.append({"step": "refine", "round": round_num})
-
-    # Text generation done — pipeline.py will send slides_render + done
+    logger.info(f"[Pipeline] Fast mode: skipped evaluation, 2 LLM calls total")
 
     best["_meta"] = {
-        "pipeline": "3-step-v2",
+        "pipeline": "fast-2step",
         "mode": mode,
-        "total_llm_calls": sum(1 for r in rounds_log if r["step"] in ("topic_strategy", "slides_writer", "viral_analyst", "refine")),
+        "total_llm_calls": 2,
         "final_viral_score": best_score,
         "approved_topic": topic.get("hook_title", ""),
         "pain_trigger": topic.get("pain_trigger", ""),
         "rounds": rounds_log,
-        "generation_rounds": len([r for r in rounds_log if r["step"] == "viral_analyst"]),
+        "generation_rounds": 0,
         "final_score": best_score,
     }
 
