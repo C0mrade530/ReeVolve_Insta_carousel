@@ -1,0 +1,9 @@
+node_modules/
+.next/
+__pycache__/
+*.pyc
+venv/
+.env
+media/
+*.zip
+.DS_Store
